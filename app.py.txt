@@ -1,0 +1,364 @@
+from torch import embedding
+from txtai.embeddings import Embeddings
+print("package loadding is successful !")
+
+#pip install txtai fastapi nest-asyncio pyngrok uvicorn pandas numpy openpyxl
+
+
+from typing import Optional, List
+import json
+
+from pprint import pprint
+import warnings
+import pandas as pd
+import os
+import shutil
+import json 
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+# Create new embeddings
+from txtai.embeddings import Embeddings
+
+# FASTAPI
+from typing import Optional
+from fastapi.middleware.cors import CORSMiddleware
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+from fastapi import Form, status
+
+from typing import Optional
+from pyngrok import ngrok
+import nest_asyncio
+import uvicorn
+import json
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=['*'],
+    allow_credentials=True,
+    allow_methods=['*'],
+    allow_headers=['*'],
+)
+
+
+class userQuery(BaseModel):
+  userQuery: dict
+  userConfig: dict
+  budget: float
+  update_model : str
+
+  
+  class config:
+    orm_mode = True
+
+
+
+
+##################################################
+#                 FETCH DATA                     #
+##################################################
+
+
+def featch_and_create_data(file_name="https://raw.githubusercontent.com/SyaTest/product-rep/main/Product%20List%20Updated.csv"):
+
+  df = pd.read_csv(file_name)
+
+  
+  df = df[['Type', 'SKU','Tags', 'Weight (kg)',
+        'Length (cm)',
+        'Width (cm)',
+        'Height (cm)',
+        'Regular price',
+        'Categories',
+        'In stock?'
+        ]]
+        
+
+  df = df.loc[df["Categories"]=="Marketplace"]
+  df = df[df['Tags'].notna()]
+  df["vol_size"] =  df["Length (cm)"] * df["Width (cm)"] * df["Height (cm)"]
+
+  return df 
+
+
+##################################################
+#             CREATE NEW EMBEDDINGS              #
+##################################################
+
+def create_embeddings_if_not_found(df):
+
+  # Create embeddings model, backed by sentence-transformers & transformers
+  embeddings = Embeddings({"path": "sentence-transformers/nli-mpnet-base-v2"})
+
+  df["Tags"] = df["Tags"].str.lower()
+
+  tags_list = list(df["Tags"].values)
+
+  # Create embeddings index with content enabled. The default behavior is to only store indexed vectors.
+  embeddings = Embeddings({"path": "sentence-transformers/nli-mpnet-base-v2", "content": True, "objects": True})
+
+  # Create an index for the list of text
+  embeddings.index([(uid, text, None) for uid, text in enumerate(tags_list)])
+  
+  try:
+    os.mkdir("model")
+    embeddings.save("model")
+    print("[Latest model] : Initial Load")
+
+  except FileExistsError:
+    # directory already exists
+    shutil.rmtree('model')      
+    
+    embeddings.save("model")
+    print("[Overwrite model] : Incremental Load")
+  
+  return embeddings
+
+
+
+##################################################
+#               LOAD EMBEDDINGS                  #
+##################################################
+
+def load_embeddings():
+  
+  embeddings = Embeddings({"path": "sentence-transformers/nli-mpnet-base-v2", "content": True, "objects": True})
+
+  embeddings.load("model")
+
+  return embeddings
+
+
+def product_finder(Query,df,embeddings):
+
+  RESULT = embeddings.search(Query, 1)
+  print("RESULT",RESULT)
+  embedding_result_df = pd.DataFrame(RESULT)
+  embedding_result_df["Query"] = Query
+  embedding_result_df.columns = ["id","Tags","Score","Query"]
+
+  if Query=="general":
+
+    print("general---------")
+    general_df = df.loc[df["Tags"]=="general"]
+
+    general_df = general_df.sample(1)
+    
+    RESULT = [{'id': general_df.index[0], 'Tags': list(general_df["Tags"].values)[0], 'Score': 1.0,'Query':list(general_df["Tags"].values)[0]}]
+    print(RESULT)
+
+    embedding_result_df = pd.DataFrame(RESULT)
+    embedding_result_df["Query"] = "general"
+    embedding_result_df.columns = ["id","Tags","Score","Query"]
+
+  return embedding_result_df
+
+
+
+def return_products(user_input,
+                    df,
+                    embeddings):
+    
+  counter = 1
+
+  total_df_obj = []
+  products_limit = 4
+
+  while counter <= products_limit:
+
+    # What do you like to drink?  , # What do you like to eat? , # What you like to do when you are free?
+
+    if counter==1:
+      
+      # Query = input("What do you like to drink? ")
+      Query = user_input["userQuery"]["1"]
+
+      embedding_result_df = product_finder(Query,df,embeddings)
+      total_df_obj.append(embedding_result_df)
+      counter+=1
+    
+    
+    if counter==2:
+      
+      # Query = input("What do you like to eat? ")
+      Query = user_input["userQuery"]["2"]
+
+      embedding_result_df = product_finder(Query,df,embeddings)
+      total_df_obj.append(embedding_result_df)
+      counter+=1
+
+    
+    if counter==3:
+
+      # Query = input("What you like to do when you are free? ")
+      Query = user_input["userQuery"]["3"]
+
+      embedding_result_df = product_finder(Query,df,embeddings)
+      total_df_obj.append(embedding_result_df)
+      counter+=1
+
+    if counter==4:
+
+      # Query = input("general item ")
+      Query = user_input["userQuery"]["4"]
+
+      embedding_result_df = product_finder(Query,df,embeddings)
+      total_df_obj.append(embedding_result_df)
+      counter+=1
+
+  embedding_result_df = pd.concat(total_df_obj,axis=0).reset_index(drop=True)
+
+  final = df.merge(embedding_result_df, how="inner",on="Tags")
+
+  # 1:  In stock
+
+  final = final.loc[final["In stock?"]==1.0]
+
+  # Found NaN in vol_size
+  final = final[final['vol_size'].notna()]
+
+  return final 
+
+
+
+def custom_filter(user_input,final):
+    
+  my_budget = user_input["budget"]
+  iteration_factor = user_input["userConfig"]["iteration_factor"]
+
+  iteration_counter = 1
+
+  print("iteration_factor :",iteration_factor)
+  print("\n")
+
+  all_recommendations = []
+  all_total_prices = []
+
+  while iteration_counter <= iteration_factor:
+
+    combinations = final.groupby('Query')['Tags','SKU','vol_size','Regular price'].apply(lambda s: s.sample(1)).reset_index()
+    
+
+    vol_size = float(combinations["vol_size"].sum())
+    total_price = float(combinations["Regular price"].sum())
+
+    print(f"[{iteration_counter}] : my_budget :{my_budget} , total_price :{total_price}, vol_size :{vol_size}")
+    
+    iteration_counter+=1
+
+    revised_total = my_budget - ( my_budget * 0.15) 
+
+    print("revised_total :",revised_total)
+    all_total_prices.append(total_price)
+
+    if (revised_total <= total_price) and (total_price <= my_budget) and (vol_size < 8000):
+      
+      
+      #print("-"*50)      
+      #print(combinations)
+      
+      combinations["set"] = iteration_counter
+      combinations["total"] = total_price
+      combinations["budget"] = my_budget
+      combinations["total_price_threshold"] = revised_total
+      
+
+      #print("✅ vol_size :",vol_size)
+      #print(f"✅ My budget ==>{my_budget} , revised total after 10% : {revised_total}")
+      #print("\n")
+      
+      all_recommendations.append(combinations)
+      
+  
+#   all_revised_total_price_avg =  sum(all_revised_total_price) / len(all_revised_total_price)
+  
+  print(f"my_budget : {my_budget} , \n all_set_total_prices : {all_total_prices}  \n , MAX_total : {max(all_total_prices)} \n , MIN_total : {min(all_total_prices)}")
+      
+  
+  try:
+    
+    embedding_result_df = pd.concat(all_recommendations,axis=0).reset_index(drop=True)
+    return embedding_result_df
+  
+  except:
+    
+    return {"status":"Please try again and check MIN and MAX prices for more info.",
+            "my_budget":my_budget,
+            "MAX_total": f"{max(all_total_prices)}",
+            "MIN_total": f"{min(all_total_prices)}",
+            "all_set_total_prices":all_total_prices}
+
+
+
+
+
+
+
+#--------------------------------------------------------------------------------------------------------------------#
+
+@app.get("/")
+async def root():
+    return {"message": "Hello World packages loaded successfully"}
+
+
+
+@app.post("/userQueryInput")
+async def userQueryFunc(payload:userQuery):
+
+    user_input = payload.dict()
+    
+    print("USER INPUT : \n",user_input)
+    
+    #----------------------------------------------#
+    
+    #          Creating or Loading Model           #
+    
+    #----------------------------------------------#
+    
+    if user_input["update_model"] == "Yes":
+      
+      df = featch_and_create_data()
+      embeddings = create_embeddings_if_not_found(df)
+          
+      final_data = return_products(user_input, df, embeddings)
+      
+      filter_data_json = custom_filter(user_input,final_data)
+      
+      
+      if type(filter_data_json) == dict:
+        return filter_data_json
+
+      else:
+        return filter_data_json.to_json(orient="records")
+      
+  
+    elif user_input["update_model"] == "No":
+      
+      df = featch_and_create_data()
+      embeddings = load_embeddings()
+          
+      final_data = return_products(user_input, df, embeddings)
+      
+      filter_data_json = custom_filter(user_input,final_data)
+      
+      
+      if type(filter_data_json) == dict:
+        return filter_data_json
+
+      else:
+        json_with_slash = filter_data_json.to_json(orient="records")
+        
+        json_without_slash = json.loads(json_with_slash)
+
+        return json_without_slash
+      
+
+#------------------------------------------------------------------------------------#   
+      
+      
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000) 
